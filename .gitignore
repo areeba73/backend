@@ -1,0 +1,23 @@
+# Python environment folders
+venv/
+.venv/
+env/
+scripts/
+bin/
+include/
+lib/
+
+# PyCharm and Editor specific
+.idea/
+.vscode/
+*.swp
+*.pyc
+__pycache__/
+
+# Sensitive Info (IMPORTANT)
+.env
+serviceAccountKey.json
+
+# OS specific
+DS_Store
+Thumbs.db

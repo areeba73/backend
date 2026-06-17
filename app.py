@@ -5,6 +5,7 @@ from routes.doctorroutes import doctor_bp
 from routes.adminroutes import admin_bp
 from routes.emotionroutes import emotion_bp
 from routes.forgetreset import auth_bp
+from routes.chatbotroutes import chatbot_bp
 import os
 import logging
 
@@ -62,6 +63,7 @@ app.register_blueprint(doctor_bp, url_prefix='/doctor')
 app.register_blueprint(admin_bp, url_prefix='/admin')  
 app.register_blueprint(auth_bp, url_prefix='/auth')
 app.register_blueprint(emotion_bp, url_prefix='/api')
+app.register_blueprint(chatbot_bp, url_prefix='/api')
 
 logger.info("All blueprints registered successfully!")
 

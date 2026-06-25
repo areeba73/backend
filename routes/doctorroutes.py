@@ -336,6 +336,57 @@ def get_current_profile(req):
         return uid, None
     return uid, doc.to_dict()
 
+def get_doctor_availability_ref(doctor_id):
+    return db.collection('users').document(doctor_id).collection('doctorAvailability').document('settings')
+
+def get_doctor_availability_data(doctor_id, profile=None):
+    ref = get_doctor_availability_ref(doctor_id)
+    doc = ref.get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        return {
+            "availability": data.get('availability') or DEFAULT_AVAILABILITY,
+            "availableDates": data.get('availableDates') or []
+        }
+
+    profile = profile or {}
+    legacy_availability = profile.get('availability')
+    legacy_dates = profile.get('availableDates')
+    if legacy_availability is not None or legacy_dates is not None:
+        migrated = {
+            "availability": legacy_availability if isinstance(legacy_availability, list) else DEFAULT_AVAILABILITY,
+            "availableDates": legacy_dates if isinstance(legacy_dates, list) else [],
+            "migratedFromUserDoc": True,
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        }
+        ref.set(migrated, merge=True)
+        db.collection('users').document(doctor_id).update({
+            "availability": firestore.DELETE_FIELD,
+            "availableDates": firestore.DELETE_FIELD
+        })
+        return {
+            "availability": migrated.get('availability'),
+            "availableDates": migrated.get('availableDates')
+        }
+
+    return {
+        "availability": DEFAULT_AVAILABILITY,
+        "availableDates": []
+    }
+
+def save_doctor_availability_data(doctor_id, availability=None, available_dates=None):
+    payload = {
+        "availability": availability if isinstance(availability, list) else DEFAULT_AVAILABILITY,
+        "availableDates": available_dates if isinstance(available_dates, list) else [],
+        "updatedAt": firestore.SERVER_TIMESTAMP
+    }
+    get_doctor_availability_ref(doctor_id).set(payload, merge=True)
+    db.collection('users').document(doctor_id).update({
+        "availability": firestore.DELETE_FIELD,
+        "availableDates": firestore.DELETE_FIELD
+    })
+    return payload
+
 def require_doctor(req):
     uid, profile = get_current_profile(req)
     if not uid or not profile:
@@ -353,6 +404,7 @@ def delete_unverified_doctor_after_12h(uid, email):
             
             if not user.email_verified:
                 auth.delete_user(uid)
+                get_doctor_availability_ref(uid).delete()
                 db.collection('users').document(uid).delete()
                 logger.info(f" Unverified doctor {email} deleted after 12 hours")
         except Exception as e:
@@ -438,6 +490,9 @@ def doctor_signup():
             'emailVerified': False if not is_admin else True,
             'verificationDeadline': datetime.utcnow() + timedelta(hours=12) if not is_admin else None
         })
+
+        if role == 'doctor':
+            save_doctor_availability_data(user.uid)
         
         message = "Admin account created!" if is_admin else "Doctor registered! Check your email for verification link. You have 12 hours to verify."
         return jsonify({
@@ -470,21 +525,21 @@ def doctor_login():
     try:
         logger.info(f" Doctor login attempt for: {email}")
         
-        user = auth.get_user_by_email(email)
-        
         # Firebase Sign In
         sign_in_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={Config.FIREBASE_WEB_API_KEY}"
         sign_in_response = requests.post(sign_in_url, json={
             "email": email,
             "password": password,
             "returnSecureToken": True
-        }, timeout=10)
+        }, timeout=30)
         
         if sign_in_response.status_code != 200:
             logger.warning(f" Invalid credentials for doctor: {email}")
             return jsonify({"error": "Invalid credentials"}), 401
         
-        id_token = sign_in_response.json().get('idToken')
+        sign_in_data = sign_in_response.json()
+        id_token = sign_in_data.get('idToken')
+        user = auth.get_user(sign_in_data.get('localId'))
         
         # Get doctor data from Firestore
         doctor_doc = db.collection('users').document(user.uid).get()
@@ -535,8 +590,9 @@ def list_doctors():
 
         for doc in docs:
             data = serialize_doc(doc.to_dict())
-            availability = data.get('availability') or DEFAULT_AVAILABILITY
-            custom_dates = data.get('availableDates')
+            availability_data = get_doctor_availability_data(doc.id, data)
+            availability = availability_data.get('availability')
+            custom_dates = availability_data.get('availableDates')
             available_dates = get_available_dates(availability, custom_dates)
             available_dates = mark_booked_slots(available_dates, get_booked_slots_by_date(doc.id))
             doctors.append({
@@ -580,8 +636,9 @@ def create_appointment():
             return jsonify({"error": "Doctor not found"}), 404
 
         doctor_data = doctor_doc.to_dict()
-        doctor_availability = doctor_data.get('availability') or DEFAULT_AVAILABILITY
-        doctor_dates = doctor_data.get('availableDates')
+        availability_data = get_doctor_availability_data(doctor_id, doctor_data)
+        doctor_availability = availability_data.get('availability')
+        doctor_dates = availability_data.get('availableDates')
         available_dates = remove_booked_slots(
             get_available_dates(doctor_availability, doctor_dates),
             get_booked_slots_by_date(doctor_id)
@@ -650,6 +707,7 @@ def get_doctor_profile():
         uid, profile, error = require_doctor(request)
         if error:
             return error
+        availability_data = get_doctor_availability_data(uid, profile)
 
         return jsonify({
             "doctor": {
@@ -659,8 +717,8 @@ def get_doctor_profile():
                 "specialty": profile.get('speciality') or '',
                 "clinicName": profile.get('clinicName') or '',
                 "mobile": profile.get('mobile') or '',
-                "availability": profile.get('availability') or DEFAULT_AVAILABILITY,
-                "availableDates": profile.get('availableDates') or []
+                "availability": availability_data.get('availability'),
+                "availableDates": availability_data.get('availableDates')
             }
         }), 200
     except Exception as e:
@@ -700,9 +758,10 @@ def get_doctor_availability():
         uid, profile, error = require_doctor(request)
         if error:
             return error
+        availability_data = get_doctor_availability_data(uid, profile)
         return jsonify({
-            "availability": profile.get('availability') or DEFAULT_AVAILABILITY,
-            "availableDates": profile.get('availableDates') or []
+            "availability": availability_data.get('availability'),
+            "availableDates": availability_data.get('availableDates')
         }), 200
     except Exception as e:
         logger.error(f" Availability fetch error: {str(e)}")
@@ -725,20 +784,16 @@ def update_doctor_availability():
         if available_dates is not None and not isinstance(available_dates, list):
             return jsonify({"error": "Available dates must be a list"}), 400
 
-        updates = {
-            "availability": availability,
-            "updatedAt": firestore.SERVER_TIMESTAMP
-        }
-        if available_dates is not None:
-            updates["availableDates"] = available_dates
-
-        db.collection('users').document(uid).update({
-            **updates
-        })
+        current_availability = get_doctor_availability_data(uid, profile)
+        saved = save_doctor_availability_data(
+            uid,
+            availability,
+            available_dates if available_dates is not None else current_availability.get('availableDates')
+        )
         return jsonify({
             "message": "Availability updated",
-            "availability": availability,
-            "availableDates": available_dates or []
+            "availability": saved.get('availability'),
+            "availableDates": saved.get('availableDates')
         }), 200
     except Exception as e:
         logger.error(f" Availability update error: {str(e)}")

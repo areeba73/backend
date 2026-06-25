@@ -1,56 +1,171 @@
 from flask import Blueprint, request, jsonify
 from firebase_admin import auth, firestore
-from config import db, Config
-from datetime import datetime
+from config import db
 
 admin_bp = Blueprint('admin', __name__)
+
+def get_user_from_token(req):
+    try:
+        header = req.headers.get('Authorization', '')
+        if not header.startswith('Bearer '):
+            return None
+        token = header.split('Bearer ', 1)[-1].strip()
+        if not token:
+            return None
+        decoded = auth.verify_id_token(token)
+        return decoded['uid']
+    except Exception:
+        return None
+
+def get_current_admin(req):
+    uid = get_user_from_token(req)
+    if not uid:
+        return None, None
+
+    doc = db.collection('users').document(uid).get()
+    if not doc.exists:
+        return uid, None
+
+    profile = doc.to_dict()
+    if profile.get('role') != 'admin':
+        return uid, profile
+
+    return uid, profile
+
+def serialize_admin(uid, profile):
+    full_name = profile.get('fullName') or 'Admin'
+    return {
+        "uid": uid,
+        "adminId": uid,
+        "email": profile.get('email') or '',
+        "fullName": full_name,
+        "name": full_name,
+        "role": profile.get('role') or 'admin'
+    }
+
+def get_password_from_payload(data):
+    return str(
+        data.get('password')
+        or data.get('newPassword')
+        or data.get('confirmPassword')
+        or ''
+    ).strip()
+
+def require_admin(req):
+    uid, profile = get_current_admin(req)
+    if not uid or not profile:
+        return None, None, (jsonify({"error": "Not authenticated"}), 401)
+    if profile.get('role') != 'admin':
+        return uid, profile, (jsonify({"error": "Admin access required"}), 403)
+    return uid, profile, None
+
+# Get logged-in admin profile
+@admin_bp.route('/me', methods=['GET'])
+def get_logged_in_admin_profile():
+    try:
+        uid, profile, error = require_admin(request)
+        if error:
+            return error
+
+        admin = serialize_admin(uid, profile)
+        return jsonify({"admin": admin, **admin}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Update logged-in admin profile
+@admin_bp.route('/me', methods=['PUT'])
+def update_logged_in_admin_profile():
+    try:
+        uid, profile, error = require_admin(request)
+        if error:
+            return error
+
+        data = request.json or {}
+        full_name = str(data.get('fullName') or data.get('name') or profile.get('fullName') or '').strip()
+        password = get_password_from_payload(data)
+
+        if len(full_name) < 3:
+            return jsonify({"error": "Full name must be at least 3 characters"}), 400
+        if password and len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+        db.collection('users').document(uid).update({
+            'fullName': full_name,
+            'updatedAt': firestore.SERVER_TIMESTAMP
+        })
+        auth.update_user(uid, display_name=full_name)
+
+        if password:
+            auth.update_user(uid, password=password)
+
+        updated_profile = {**profile, "fullName": full_name}
+        admin = serialize_admin(uid, updated_profile)
+        return jsonify({
+            "message": "Profile updated successfully",
+            "admin": admin,
+            **admin
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Get admin profile
 @admin_bp.route('/profile/<admin_id>', methods=['GET', 'OPTIONS'])
 def get_admin_profile(admin_id):
+    if request.method == 'OPTIONS':
+        return '', 204
+
     try:
-        admin_doc = db.collection('users').document(admin_id).get()
-        
-        if not admin_doc.exists:
-            return jsonify({"error": "Admin not found"}), 404
-        
-        admin_data = admin_doc.to_dict()
-        return jsonify({
-            "adminId": admin_id,
-            "name": admin_data.get('fullName', 'Admin'),
-            "email": admin_data.get('email', '')
-        }), 200
+        uid, profile, error = require_admin(request)
+        if error:
+            return error
+        if uid != admin_id:
+            return jsonify({"error": "You can update only your own admin profile"}), 403
+
+        admin = serialize_admin(uid, profile)
+        return jsonify({"admin": admin, **admin}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": str(e)}), 500
 
 # Update admin profile
 @admin_bp.route('/profile/<admin_id>', methods=['POST', 'OPTIONS'])
 def update_admin_profile(admin_id):
+    if request.method == 'OPTIONS':
+        return '', 204
+
     try:
-        data = request.json
-        
-        # Update Firestore
+        uid, profile, error = require_admin(request)
+        if error:
+            return error
+        if uid != admin_id:
+            return jsonify({"error": "You can update only your own admin profile"}), 403
+
+        data = request.json or {}
+        full_name = str(data.get('fullName') or data.get('name') or profile.get('fullName') or '').strip()
+        password = get_password_from_payload(data)
+
+        if len(full_name) < 3:
+            return jsonify({"error": "Full name must be at least 3 characters"}), 400
+        if password and len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+
         db.collection('users').document(admin_id).update({
-            'fullName': data.get('name'),
-            'email': data.get('email'),
-            'updatedAt': datetime.utcnow()
+            'fullName': full_name,
+            'updatedAt': firestore.SERVER_TIMESTAMP
         })
-        
-        # Update Firebase Auth password agar diya gaya ho
-        if data.get('password') and len(data.get('password', '')) >= 6:
-            try:
-                auth.update_user(admin_id, password=data.get('password'))
-            except Exception as pwd_error:
-                return jsonify({"error": f"Password update failed: {str(pwd_error)}"}), 400
-        
+        auth.update_user(admin_id, display_name=full_name)
+
+        if password:
+            auth.update_user(admin_id, password=password)
+
+        updated_profile = {**profile, "fullName": full_name}
+        admin = serialize_admin(admin_id, updated_profile)
         return jsonify({
-            "adminId": admin_id,
-            "name": data.get('name'),
-            "email": data.get('email'),
-            "message": "Profile updated successfully"
+            "message": "Profile updated successfully",
+            "admin": admin,
+            **admin
         }), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": str(e)}), 500
 
 # Get all users
 @admin_bp.route('/users', methods=['GET', 'OPTIONS'])
@@ -120,6 +235,7 @@ def delete_doctor(doctor_id):
         auth.delete_user(doctor_id)
         
         # Delete from Firestore
+        db.collection('users').document(doctor_id).collection('doctorAvailability').document('settings').delete()
         db.collection('users').document(doctor_id).delete()
         
         return jsonify({"message": "Doctor deleted successfully"}), 200

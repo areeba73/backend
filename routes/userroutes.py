@@ -206,21 +206,21 @@ def user_login():
     try:
         logger.info(f" Login attempt for: {email}")
         
-        user = auth.get_user_by_email(email)
-        
         # Firebase Sign In
         sign_in_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={Config.FIREBASE_WEB_API_KEY}"
         sign_in_response = requests.post(sign_in_url, json={
             "email": email,
             "password": password,
             "returnSecureToken": True
-        }, timeout=10)
+        }, timeout=30)
         
         if sign_in_response.status_code != 200:
             logger.warning(f" Invalid credentials for: {email}")
             return jsonify({"error": "Invalid credentials"}), 401
         
-        id_token = sign_in_response.json().get('idToken')
+        sign_in_data = sign_in_response.json()
+        id_token = sign_in_data.get('idToken')
+        user = auth.get_user(sign_in_data.get('localId'))
         
         # Get user data from Firestore
         user_doc = db.collection('users').document(user.uid).get()

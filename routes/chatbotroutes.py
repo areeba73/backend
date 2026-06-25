@@ -18,37 +18,17 @@ QUOTA_LIMIT_MESSAGE = "Daily AI limit reached. Please try again tomorrow."
 MODEL_BUSY_MESSAGE = "EmoBot is busy right now. Please try again in a moment."
 
 SYSTEM_PROMPT = """
-You are EmoBot, a calm emotional-support companion inside a mood tracking app.
-Your job is to help the user feel heard, calmer, and a little less stressed.
+You are EmoBot, a real conversational emotional-support chatbot inside a mood tracking app.
+Talk to the user naturally and help them calm down according to their latest detected mood and severity.
 
-Reply rules:
-- Keep replies very short: 1 to 2 simple sentences only.
-- Keep the full reply under 35 words.
-- Use a warm, gentle tone.
-- Do not give long explanations unless the user asks.
-- Ask only one soft follow-up question.
-- Avoid diagnosis, medical claims, or alarming language.
-- If the user sounds stressed, suggest one tiny grounding step like slow breathing, relaxing shoulders, or naming one feeling.
-- Use the latest detected mood and severity when available. The app detects these moods: angry, disgust, fear, happy, neutral, sad, and surprise.
-- Do not wait for the user to tell you their mood. If detected mood context is available, quietly use it from the start.
-- Do not sound technical. Do not mention confidence percentages unless the user asks.
-- You may naturally acknowledge the detected mood, for example "Lagta hai kuch unexpected hua" for surprise, without saying "your detected mood is surprise".
-- For High severity, focus first on calming the user with one immediate grounding step. Gently suggest talking to a trusted person or doctor if they feel unsafe or overwhelmed.
-- For Medium severity, validate the feeling and suggest one simple coping exercise.
-- For Low severity, keep it light, supportive, and reflective.
-- You may recommend one exercise, breathing practice, calming activity, or a search phrase for a calming video when it fits the user's mood.
-- Never repeat the same exact response. Generate a fresh reply based on the user's message, detected mood, and severity.
-- Reply in simple Roman Urdu or English only.
-- Do not use Hindi/Devanagari script. Avoid words like aapka in Hindi style; prefer Pakistani Roman Urdu such as "aap", "theek", "saans", "dil halka".
-- If the user writes Roman Urdu, reply in Roman Urdu. If the user writes English, reply in English.
-- Never use bullet points, numbered lists, headings, markdown, or long step-by-step answers.
-- Your final answer must not contain any Devanagari characters.
-- If the user greets you or asks how you are, answer as EmoBot in a warm human-like support tone. Do not say "as an AI" or explain that you do not have feelings.
+Use the mood context quietly. Do not give one fixed template for a mood. Do not repeat the same response.
+If severity is high, first help the user settle their body with a gentle grounding or breathing suggestion, then continue the conversation.
+Validate feelings, speak warmly, and ask one natural follow-up question when it helps.
+Do not diagnose, do not make medical claims, and do not sound robotic.
+If the user may be unsafe or overwhelmed, gently suggest contacting a trusted person, doctor, or emergency support.
+Reply in the same style as the user: Roman Urdu for Roman Urdu, English for English.
+Do not use Hindi/Devanagari script.
 """
-
-DEVANAGARI_PATTERN = re.compile(r'[\u0900-\u097F]')
-MAX_REPLY_WORDS = 35
-
 if GEMINI_API_KEY:
     print(f"GEMINI_API_KEY found: {GEMINI_API_KEY[:10]}...")
     print(f"Using model: {available_model}")
@@ -97,6 +77,26 @@ def serialize_chat_doc(data):
         serialized['timestamp'] = timestamp.isoformat()
     return serialized
 
+def get_recent_chat_context(user_id, limit=8):
+    """Get recent chat turns so Gemini can reply like an ongoing conversation."""
+    try:
+        if not user_id:
+            return []
+
+        docs = (db.collection('users')
+                .document(user_id)
+                .collection('chats')
+                .order_by('timestamp', direction='DESCENDING')
+                .limit(limit)
+                .stream())
+
+        history = [doc.to_dict() for doc in docs]
+        history.reverse()
+        return history
+    except Exception as e:
+        print(f"Chat context fetch error: {e}")
+        return []
+
 def get_latest_emotion_context(user_id):
     """Get the user's latest emotion/severity result for mood-aware chat."""
     try:
@@ -129,78 +129,55 @@ def get_latest_emotion_context(user_id):
         print(f"Emotion context fetch error: {e}")
         return None
 
-def build_chat_prompt(message, emotion_context=None):
+def build_chat_prompt(message, emotion_context=None, chat_history=None, retry_note=None):
     context_lines = []
     if emotion_context:
         context_lines = [
-            "Latest detected user state from this app:",
-            f"- Scan source: {emotion_context.get('source') or 'unknown'}",
-            f"- Mood/emotion: {emotion_context.get('emotion') or 'unknown'}",
-            f"- Severity: {emotion_context.get('severity_level') or 'unknown'}",
-            f"- Severity score: {emotion_context.get('severity_score') or 'unknown'}",
-            f"- Existing app suggestion: {emotion_context.get('suggestion') or 'none'}",
+            "Latest detected mood context from the app:",
+            f"Mood/emotion: {emotion_context.get('emotion') or 'unknown'}",
+            f"Severity: {emotion_context.get('severity_level') or 'unknown'}",
+            f"App suggestion: {emotion_context.get('suggestion') or 'none'}",
             "",
-            "Use this state as hidden context from the start. The user should not need to explain their mood again."
+            "Use this as context, but speak naturally. Do not just repeat these labels."
         ]
     else:
         context_lines = [
             "No latest mood scan is available. Respond supportively based on the user's message only."
         ]
 
-    return f"{SYSTEM_PROMPT}\n\n" + "\n".join(context_lines) + f"\n\nUser message: {message}"
+    history_lines = []
+    for chat in chat_history or []:
+        user_text = str(chat.get('user_message') or '').strip()
+        bot_text = str(chat.get('bot_response') or '').strip()
+        if user_text:
+            history_lines.append(f"User: {user_text}")
+        if bot_text:
+            history_lines.append(f"EmoBot: {bot_text}")
 
-def build_safe_fallback(emotion_context=None):
-    emotion = ((emotion_context or {}).get('emotion') or '').lower()
-    severity = ((emotion_context or {}).get('severity_level') or '').lower()
+    retry_lines = []
+    if retry_note:
+        retry_lines = ["", retry_note]
 
-    if severity == 'high':
-        return "Aap thora pause lein aur 3 slow saans lein. Yeh surprise achi baat se hua ya tension se?"
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        + "\n".join(context_lines)
+        + ("\n\nRecent conversation:\n" + "\n".join(history_lines) if history_lines else "")
+        + "\n\nCurrent user message:\n"
+        + message
+        + "\n\nReply as EmoBot now."
+        + "\n".join(retry_lines)
+    )
 
-    if emotion in ['surprise', 'surprised']:
-        return "Lagta hai kuch unexpected hua hai. Yeh surprise positive tha ya stressful?"
-
-    if emotion in ['sad', 'sadness']:
-        return "Mujhe lagta hai aap thora heavy feel kar rahe hain. Kis baat ne sab se zyada dil par asar kiya?"
-
-    if emotion in ['angry', 'anger']:
-        return "Aap pehle thora pause lein aur shoulders relax karein. Kis cheez ne aap ko trigger kiya?"
-
-    if emotion in ['fear', 'fearful']:
-        return "Aap apne around 3 cheezen notice karein jo aap dekh sakte hain. Kis baat ka dar zyada feel ho raha hai?"
-
-    return "Main aap ke sath hoon. Ek slow saans lein, abhi sab se zyada kya feel ho raha hai?"
+def is_broken_ai_response(text):
+    cleaned = re.sub(r'\s+', ' ', str(text or '')).strip()
+    meaningful_chars = re.sub(r'[^A-Za-z0-9]', '', cleaned)
+    return len(meaningful_chars) < 8 or len(cleaned.split()) < 2
 
 def clean_bot_response(text, emotion_context=None):
-    """Keep Gemini replies short and in Roman Urdu/English for the UI."""
-    if not text:
-        return "Main aap ke sath hoon. Abhi ek slow saans lein."
+    """Only normalize spacing. Let Gemini provide the actual chatbot response."""
+    return re.sub(r'\s+', ' ', str(text or '')).strip()
 
-    lower_text = text.lower()
-    generic_ai_phrases = [
-        'as an ai',
-        "i don't have feelings",
-        'i do not have feelings',
-        'physical state like humans',
-        'how can i help you today'
-    ]
-
-    if DEVANAGARI_PATTERN.search(text) or any(phrase in lower_text for phrase in generic_ai_phrases):
-        return build_safe_fallback(emotion_context)
-
-    cleaned = re.sub(r'\s+', ' ', text).strip()
-    sentences = re.split(r'(?<=[.!?])\s+', cleaned)
-    if len(sentences) > 2:
-        cleaned = ' '.join(sentences[:2]).strip()
-
-    words = cleaned.split()
-
-    if len(words) <= MAX_REPLY_WORDS:
-        return cleaned
-
-    short = ' '.join(words[:MAX_REPLY_WORDS]).rstrip('.,;:')
-    return f"{short}."
-
-def call_gemini_rest_api(message, emotion_context=None):
+def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
     """Call Gemini API using REST endpoint"""
     try:
         url = f"https://generativelanguage.googleapis.com/v1/models/{available_model}:generateContent?key={GEMINI_API_KEY}"
@@ -208,42 +185,53 @@ def call_gemini_rest_api(message, emotion_context=None):
         headers = {
             "Content-Type": "application/json"
         }
-        
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": build_chat_prompt(message, emotion_context)
-                        }
-                    ]
+
+        retry_note = None
+        for attempt in range(2):
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": build_chat_prompt(message, emotion_context, chat_history, retry_note)
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "maxOutputTokens": 512,
+                    "temperature": 0.85,
+                    "topP": 0.95
                 }
-            ],
-            "generationConfig": {
-                "maxOutputTokens": 70,
-                "temperature": 0.5,
-                "topP": 0.9
             }
-        }
-        
-        print(f"Calling Gemini API with model: {available_model}...")
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        print(f"Response Status: {response.status_code}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            print("Response received")
             
-            if 'candidates' in data and len(data['candidates']) > 0:
-                candidate = data['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    text = candidate['content']['parts'][0]['text']
-                    print(f"Text: {text[:50]}...")
-                    return clean_bot_response(text, emotion_context)
+            print(f"Calling Gemini API with model: {available_model}, attempt {attempt + 1}...")
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
             
-            return "I couldn't generate a response. Please try again."
-        else:
+            print(f"Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                print("Response received")
+                
+                if 'candidates' in data and len(data['candidates']) > 0:
+                    candidate = data['candidates'][0]
+                    parts = candidate.get('content', {}).get('parts', [])
+                    text = ' '.join(part.get('text', '') for part in parts if part.get('text')).strip()
+                    if text and not is_broken_ai_response(text):
+                        print(f"Text: {text[:50]}...")
+                        return clean_bot_response(text, emotion_context)
+
+                    print(f"Gemini returned broken/no text. finishReason={candidate.get('finishReason')} text={text[:30] if text else ''}")
+                    retry_note = "Your previous response was empty or too short. Give a complete, natural, calming reply now."
+                    continue
+
+                retry_note = "No valid response was produced. Give a complete, natural, calming reply now."
+                continue
+
+            break
+
+        if response.status_code != 200:
             error_text = response.text
             print(f"API Error {response.status_code}: {error_text[:200]}")
             try:
@@ -255,23 +243,25 @@ def call_gemini_rest_api(message, emotion_context=None):
                         return QUOTA_LIMIT_MESSAGE
                     if response.status_code in [500, 503] or status in ['UNAVAILABLE', 'ABORTED'] or 'high demand' in msg.lower() or 'overloaded' in msg.lower():
                         return MODEL_BUSY_MESSAGE
-                    return f"API Error: {msg[:100]}"
+                    print(f"Gemini API error: {msg[:200]}")
             except:
                 pass
             if response.status_code == 429 or 'quota' in error_text.lower():
                 return QUOTA_LIMIT_MESSAGE
             if response.status_code in [500, 503] or 'high demand' in error_text.lower() or 'overloaded' in error_text.lower():
                 return MODEL_BUSY_MESSAGE
-            return f"API Error {response.status_code}"
+            return MODEL_BUSY_MESSAGE
+
+        return MODEL_BUSY_MESSAGE
     
     except requests.exceptions.Timeout:
         print(" Request timed out")
-        return "Request timed out. Please try again."
+        return MODEL_BUSY_MESSAGE
     except Exception as e:
         print(f" Error: {e}")
         import traceback
         traceback.print_exc()
-        return f"Error: {str(e)}"
+        return MODEL_BUSY_MESSAGE
 
 # ============== SEND MESSAGE ==============
 @chatbot_bp.route('/chatbot/message', methods=['POST'])
@@ -301,11 +291,12 @@ def send_message():
         # Get user ID (optional)
         user_id = get_user_from_token(request)
         emotion_context = get_latest_emotion_context(user_id)
+        chat_history = get_recent_chat_context(user_id)
         
         print(f"\nUser: {user_message}")
         
         # Call Gemini API
-        bot_response = call_gemini_rest_api(user_message, emotion_context)
+        bot_response = call_gemini_rest_api(user_message, emotion_context, chat_history)
         
         print(f"Bot: {bot_response[:50]}...\n")
         

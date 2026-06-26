@@ -23,7 +23,9 @@ Talk to the user naturally and help them calm down according to their latest det
 
 Use the mood context quietly. Do not give one fixed template for a mood. Do not repeat the same response.
 If severity is high, first help the user settle their body with a gentle grounding or breathing suggestion, then continue the conversation.
-Validate feelings, speak warmly, and ask one natural follow-up question when it helps.
+Validate feelings and speak warmly. Give a complete reply before asking any follow-up question.
+Do not shorten, summarize, or cut off your answer. Avoid tiny one-line replies unless the user clearly asks for a very short answer.
+When the user needs support, use 2 to 5 natural short paragraphs so the response feels complete but still conversational.
 Do not diagnose, do not make medical claims, and do not sound robotic.
 If the user may be unsafe or overwhelmed, gently suggest contacting a trusted person, doctor, or emergency support.
 Reply in the same style as the user: Roman Urdu for Roman Urdu, English for English.
@@ -147,8 +149,8 @@ def build_chat_prompt(message, emotion_context=None, chat_history=None, retry_no
 
     history_lines = []
     for chat in chat_history or []:
-        user_text = str(chat.get('user_message') or '').strip()
-        bot_text = str(chat.get('bot_response') or '').strip()
+        user_text = str(chat.get('user_message') or '')
+        bot_text = str(chat.get('bot_response') or '')
         if user_text:
             history_lines.append(f"User: {user_text}")
         if bot_text:
@@ -164,18 +166,18 @@ def build_chat_prompt(message, emotion_context=None, chat_history=None, retry_no
         + ("\n\nRecent conversation:\n" + "\n".join(history_lines) if history_lines else "")
         + "\n\nCurrent user message:\n"
         + message
-        + "\n\nReply as EmoBot now."
+        + "\n\nReply as EmoBot now with a complete, uncut response."
         + "\n".join(retry_lines)
     )
 
 def is_broken_ai_response(text):
-    cleaned = re.sub(r'\s+', ' ', str(text or '')).strip()
+    cleaned = re.sub(r'\s+', ' ', str(text or ''))
     meaningful_chars = re.sub(r'[^A-Za-z0-9]', '', cleaned)
     return len(meaningful_chars) < 8 or len(cleaned.split()) < 2
 
 def clean_bot_response(text, emotion_context=None):
-    """Only normalize spacing. Let Gemini provide the actual chatbot response."""
-    return re.sub(r'\s+', ' ', str(text or '')).strip()
+    """Return Gemini's response without shortening or compacting it."""
+    return str(text or '')
 
 def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
     """Call Gemini API using REST endpoint"""
@@ -199,7 +201,7 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
                     }
                 ],
                 "generationConfig": {
-                    "maxOutputTokens": 512,
+                    "maxOutputTokens": 2048,
                     "temperature": 0.85,
                     "topP": 0.95
                 }
@@ -217,16 +219,16 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
                 if 'candidates' in data and len(data['candidates']) > 0:
                     candidate = data['candidates'][0]
                     parts = candidate.get('content', {}).get('parts', [])
-                    text = ' '.join(part.get('text', '') for part in parts if part.get('text')).strip()
+                    text = ''.join(part.get('text', '') for part in parts if part.get('text'))
                     if text and not is_broken_ai_response(text):
-                        print(f"Text: {text[:50]}...")
+                        print(f"Text: {text}")
                         return clean_bot_response(text, emotion_context)
 
-                    print(f"Gemini returned broken/no text. finishReason={candidate.get('finishReason')} text={text[:30] if text else ''}")
-                    retry_note = "Your previous response was empty or too short. Give a complete, natural, calming reply now."
+                    print(f"Gemini returned broken/no text. finishReason={candidate.get('finishReason')} text={text if text else ''}")
+                    retry_note = "Your previous response was empty or too short. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer."
                     continue
 
-                retry_note = "No valid response was produced. Give a complete, natural, calming reply now."
+                retry_note = "No valid response was produced. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer."
                 continue
 
             break
@@ -283,7 +285,7 @@ def send_message():
         if not data or 'message' not in data:
             return jsonify({"error": "No message provided"}), 400
         
-        user_message = data.get('message', '').strip()
+        user_message = data.get('message', '')
         
         if not user_message:
             return jsonify({"error": "Message cannot be empty"}), 400
@@ -298,7 +300,7 @@ def send_message():
         # Call Gemini API
         bot_response = call_gemini_rest_api(user_message, emotion_context, chat_history)
         
-        print(f"Bot: {bot_response[:50]}...\n")
+        print(f"Bot: {bot_response}\n")
         
         # Save to Firebase if user logged in
         if user_id:

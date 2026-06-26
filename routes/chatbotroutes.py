@@ -25,7 +25,8 @@ Use the mood context quietly. Do not give one fixed template for a mood. Do not 
 If severity is high, first help the user settle their body with a gentle grounding or breathing suggestion, then continue the conversation.
 Validate feelings and speak warmly. Give a complete reply before asking any follow-up question.
 Do not shorten, summarize, or cut off your answer. Avoid tiny one-line replies unless the user clearly asks for a very short answer.
-When the user needs support, use 2 to 5 natural short paragraphs so the response feels complete but still conversational.
+Give enough detail that the user feels fully answered. When the user needs support, usually use 3 to 6 natural paragraphs with practical, calming guidance.
+Do not end early after only one suggestion. Complete the thought, then ask a follow-up question if it helps.
 Do not diagnose, do not make medical claims, and do not sound robotic.
 If the user may be unsafe or overwhelmed, gently suggest contacting a trusted person, doctor, or emergency support.
 Reply in the same style as the user: Roman Urdu for Roman Urdu, English for English.
@@ -175,6 +176,13 @@ def is_broken_ai_response(text):
     meaningful_chars = re.sub(r'[^A-Za-z0-9]', '', cleaned)
     return len(meaningful_chars) < 8 or len(cleaned.split()) < 2
 
+def is_too_short_ai_response(text, user_message):
+    """Detect replies that are valid but too tiny for emotional-support chat."""
+    cleaned = re.sub(r'\s+', ' ', str(text or '')).strip()
+    user_words = len(str(user_message or '').split())
+    reply_words = len(cleaned.split())
+    return user_words >= 3 and reply_words < 35
+
 def clean_bot_response(text, emotion_context=None):
     """Return Gemini's response without shortening or compacting it."""
     return str(text or '')
@@ -201,7 +209,7 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
                     }
                 ],
                 "generationConfig": {
-                    "maxOutputTokens": 2048,
+                    "maxOutputTokens": 4096,
                     "temperature": 0.85,
                     "topP": 0.95
                 }
@@ -218,17 +226,21 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
                 
                 if 'candidates' in data and len(data['candidates']) > 0:
                     candidate = data['candidates'][0]
+                    finish_reason = candidate.get('finishReason')
                     parts = candidate.get('content', {}).get('parts', [])
                     text = ''.join(part.get('text', '') for part in parts if part.get('text'))
-                    if text and not is_broken_ai_response(text):
+                    print(f"Gemini finishReason={finish_reason} response_chars={len(text)} response_words={len(text.split()) if text else 0}")
+
+                    too_short = is_too_short_ai_response(text, message)
+                    if text and not is_broken_ai_response(text) and (not too_short or attempt == 1):
                         print(f"Text: {text}")
                         return clean_bot_response(text, emotion_context)
 
-                    print(f"Gemini returned broken/no text. finishReason={candidate.get('finishReason')} text={text if text else ''}")
-                    retry_note = "Your previous response was empty or too short. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer."
+                    print(f"Gemini returned broken/too-short text. finishReason={finish_reason} text={text if text else ''}")
+                    retry_note = "Your previous response was empty or too short. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer. Use several helpful sentences and do not summarize."
                     continue
 
-                retry_note = "No valid response was produced. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer."
+                retry_note = "No valid response was produced. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer. Use several helpful sentences and do not summarize."
                 continue
 
             break

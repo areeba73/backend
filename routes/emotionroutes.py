@@ -1,20 +1,28 @@
 from flask import Blueprint, request, jsonify
 from models.face_emotion import face_detector
-from models.voice_emotion import voice_detector
+from models.voice_emotion import VOICE_ENGINE, voice_detector
 from models.text_emotion import text_detector
 import os
+import re
+import requests
 from werkzeug.utils import secure_filename
 import tempfile
 from config import db
 import datetime
+import threading
 from firebase_admin import auth
 from models.severity_model import severity_estimator
 
 emotion_bp = Blueprint('emotion', __name__, url_prefix='/emotion')
 
 ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
-ALLOWED_AUDIO_EXTENSIONS = {'wav', 'mp3', 'ogg', 'flac', 'm4a'}
+ALLOWED_AUDIO_EXTENSIONS = {'wav', 'mp3', 'ogg', 'flac', 'm4a', 'webm'}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_RECOMMENDATION_MODEL = "gemini-2.5-flash"
+_gemini_session = requests.Session()
+_gemini_session.trust_env = False
+_gemini_session.proxies = {}
 
 def allowed_file(filename, allowed_extensions):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
@@ -37,35 +45,163 @@ def get_severity(emotion, confidence, all_emotions=None, source=None):
     """Estimate severity from the full AI emotion distribution."""
     return severity_estimator.predict(emotion, confidence, all_emotions, source)
 
-def get_suggestion(emotion, severity_level):
-    emotion = (emotion or '').lower()
-    suggestions = {
-        'happy': 'Keep smiling and note what helped you feel good today.',
-        'joy': 'Keep smiling and note what helped you feel good today.',
-        'neutral': 'Stay balanced. A short walk or hydration break can help maintain focus.',
-        'sad': 'Try listening to calming music or talk to someone you trust.',
-        'sadness': 'Try listening to calming music or talk to someone you trust.',
-        'angry': 'Pause for a minute and take 5 slow deep breaths.',
-        'anger': 'Pause for a minute and take 5 slow deep breaths.',
-        'fear': 'Ground yourself by naming five things you can see around you.',
-        'fearful': 'Ground yourself by naming five things you can see around you.',
-        'disgust': 'Step away for a moment and reset with a calmer activity.',
-        'disgusted': 'Step away for a moment and reset with a calmer activity.',
-        'surprise': 'Take a moment to process what changed, then respond calmly.'
+def clean_ai_recommendation(text):
+    cleaned = re.sub(r'\s+', ' ', str(text or '')).strip()
+    cleaned = re.sub(r'^[\-\*\d\.\)\s]+', '', cleaned)
+    return cleaned.strip('"\' ')
+
+def summarize_emotion_distribution(all_emotions):
+    if not isinstance(all_emotions, dict):
+        return "not available"
+
+    def as_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    top_items = sorted(
+        all_emotions.items(),
+        key=lambda item: as_float(item[1]),
+        reverse=True
+    )[:3]
+    return ", ".join(f"{name}: {as_float(score):.2f}" for name, score in top_items) or "not available"
+
+def summarize_source_results(source_results):
+    if not isinstance(source_results, dict):
+        return "not available"
+
+    summaries = []
+    for source, data in source_results.items():
+        if not isinstance(data, dict):
+            continue
+        severity = data.get('severity') or {}
+        summaries.append(
+            f"{source}: mood={data.get('emotion') or 'unknown'}, "
+            f"confidence={data.get('confidence') or 'unknown'}, "
+            f"severity={severity.get('level') or 'unknown'}"
+        )
+    return "; ".join(summaries) or "not available"
+
+def fallback_recommendation(emotion, severity=None, source=None):
+    normalized_emotion = str(emotion or 'unknown').strip().lower()
+    level = str((severity or {}).get('level') or '').lower()
+    source_phrases = {
+        'face': 'Your facial expression looks',
+        'voice': 'Your voice sounds',
+        'text': 'Your words suggest',
+        'multimodal': 'Your combined scan suggests'
     }
+    intro = source_phrases.get(source, 'Your scan suggests')
+    emotion_label = normalized_emotion if normalized_emotion != 'unknown' else 'an unclear mood'
+    mood_actions = {
+        'angry': 'Step away from the trigger for a few minutes, relax your shoulders, and write the main thing you need before replying.',
+        'anger': 'Step away from the trigger for a few minutes, relax your shoulders, and write the main thing you need before replying.',
+        'disgust': 'Give yourself some distance from what feels uncomfortable, rinse your face or drink water, and choose one clean next step.',
+        'disgusted': 'Give yourself some distance from what feels uncomfortable, rinse your face or drink water, and choose one clean next step.',
+        'fear': 'Ground yourself by naming five things around you, slow your breathing, and handle only the next small task.',
+        'fearful': 'Ground yourself by naming five things around you, slow your breathing, and handle only the next small task.',
+        'happy': 'Enjoy the good moment and protect it: share it with someone, note what helped, or plan one small follow-up.',
+        'joy': 'Enjoy the good moment and protect it: share it with someone, note what helped, or plan one small follow-up.',
+        'neutral': 'Use this steady moment to check your energy, stretch briefly, and pick one simple thing that supports the rest of your day.',
+        'sad': 'Be gentle with yourself: take a warm drink, send one message to someone safe, and choose a tiny task instead of pushing hard.',
+        'sadness': 'Be gentle with yourself: take a warm drink, send one message to someone safe, and choose a tiny task instead of pushing hard.',
+        'surprise': 'Pause before reacting, take a slow breath, and give yourself a moment to understand what changed.',
+        'surprised': 'Pause before reacting, take a slow breath, and give yourself a moment to understand what changed.'
+    }
+    action = mood_actions.get(
+        normalized_emotion,
+        'Take a small reset: drink water, breathe slowly for a minute, and check in with what you need right now.'
+    )
+    if level == 'high':
+        return f"{intro} {emotion_label}. {action} If this feels intense or keeps building, talk to the chatbot, a trusted person, or a doctor."
+    return f"{intro} {emotion_label}. {action}"
 
-    if severity_level == 'High':
-        return 'Your stress signal looks high. Consider talking to the chatbot or finding a doctor.'
-    return suggestions.get(emotion, 'Take a short break and check in with yourself.')
+def build_recommendation_prompt(emotion, severity, source, confidence=None, all_emotions=None, source_results=None):
+    severity = severity or {}
+    return f"""
+You write fresh, mood-aware result-page recommendations for EmoTrack, an emotional wellness app.
 
-def get_multimodal_suggestion(severity_level):
-    if severity_level == 'High':
-        return 'Your combined face, voice, and text signals show high stress. Consider talking to the chatbot or finding a doctor.'
-    if severity_level == 'Medium':
-        return 'Your combined signals show moderate stress. Take a pause, breathe slowly, and check in again later.'
-    return 'Your combined signals look stable. Keep tracking your mood and notice what supports you.'
+Detected result:
+Source: {source or 'unknown'}
+Mood/emotion: {emotion or 'unknown'}
+Confidence: {confidence if confidence is not None else 'unknown'}
+Severity level: {severity.get('level') or 'unknown'}
+Severity score: {severity.get('score') if severity.get('score') is not None else 'unknown'}
+Top emotion distribution: {summarize_emotion_distribution(all_emotions)}
+Source breakdown: {summarize_source_results(source_results)}
 
-def enrich_emotion_result(result, source):
+Write one personalized recommendation for the result page based on this detected mood and severity.
+Do not use a fixed template and do not repeat the input labels mechanically.
+Do not diagnose or make medical claims.
+If severity is high, gently suggest talking to the chatbot, a trusted person, or a doctor.
+Keep it practical, warm, and specific. Use simple English. Return only the recommendation text.
+Length: 25 to 55 words.
+"""
+
+def generate_ai_recommendation(emotion, severity, source, confidence=None, all_emotions=None, source_results=None):
+    """Generate a result-page recommendation from Gemini based on the detected mood."""
+    if not GEMINI_API_KEY:
+        return None, 'unavailable'
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_RECOMMENDATION_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": build_recommendation_prompt(
+                                emotion,
+                                severity,
+                                source,
+                                confidence,
+                                all_emotions,
+                                source_results
+                            )
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "maxOutputTokens": 120,
+                "temperature": 0.9,
+                "topP": 0.95,
+                "thinkingConfig": {
+                    "thinkingBudget": 0
+                }
+            }
+        }
+        response = _gemini_session.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=float(os.getenv("GEMINI_RECOMMENDATION_TIMEOUT", "12")),
+            proxies={"http": None, "https": None}
+        )
+        if response.status_code != 200:
+            print(f"Gemini recommendation error {response.status_code}: {response.text[:200]}")
+            return None, 'unavailable'
+
+        data = response.json()
+        candidates = data.get('candidates') or []
+        if not candidates:
+            return None, 'unavailable'
+
+        parts = candidates[0].get('content', {}).get('parts', [])
+        text = clean_ai_recommendation(''.join(part.get('text', '') for part in parts if part.get('text')))
+        word_count = len(text.split())
+        if word_count < 8 or word_count > 80:
+            return None, 'unavailable'
+        return text, 'ai'
+    except requests.exceptions.RequestException as e:
+        print(f"Gemini recommendation request error: {e}")
+        return None, 'unavailable'
+    except Exception as e:
+        print(f"Gemini recommendation error: {e}")
+        return None, 'unavailable'
+
+def enrich_emotion_result(result, source, include_ai_recommendation=True):
     if not result or 'emotion' not in result:
         return result
 
@@ -79,11 +215,47 @@ def enrich_emotion_result(result, source):
         **result,
         'type': source,
         'severity': severity,
-        'suggestion': get_suggestion(result.get('emotion'), severity['level']),
         'timestamp': datetime.datetime.now().isoformat(),
         'date': datetime.date.today().isoformat()
     }
+    recommendation = fallback_recommendation(result.get('emotion'), severity, source)
+    recommendation_source = 'local'
+    if include_ai_recommendation:
+        ai_recommendation, ai_recommendation_source = generate_ai_recommendation(
+            result.get('emotion'),
+            severity,
+            source,
+            result.get('confidence'),
+            result.get('all_emotions')
+        )
+        if ai_recommendation:
+            recommendation = ai_recommendation
+            recommendation_source = ai_recommendation_source
+    enriched['suggestion'] = recommendation
+    enriched['recommendation'] = recommendation
+    enriched['recommendation_source'] = recommendation_source
     return enriched
+
+def save_emotion_to_firebase_async(request_headers, emotion_type, emotion_data):
+    """Persist emotion result without blocking the detection response."""
+    header = request_headers.get('Authorization', '')
+    if not header.startswith('Bearer '):
+        return
+
+    token = header.split('Bearer ', 1)[-1].strip()
+    if not token:
+        return
+
+    emotion_snapshot = dict(emotion_data)
+
+    def worker():
+        try:
+            decoded = auth.verify_id_token(token)
+            save_emotion_to_firebase(decoded['uid'], emotion_type, emotion_snapshot)
+        except Exception as e:
+            print(f"Firebase async save error: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 def serialize_history_doc(data):
     serialized = dict(data)
@@ -106,6 +278,8 @@ def save_emotion_to_firebase(user_id, emotion_type, emotion_data):
             'all_emotions': emotion_data.get('all_emotions'),
             'severity': emotion_data.get('severity'),
             'suggestion': emotion_data.get('suggestion'),
+            'recommendation': emotion_data.get('recommendation'),
+            'recommendation_source': emotion_data.get('recommendation_source'),
             'face_detected': emotion_data.get('face_detected'),
             'timestamp': datetime.datetime.now(),
             'date': datetime.date.today().isoformat()
@@ -129,6 +303,8 @@ def save_multimodal_severity_to_firebase(user_id, severity_data):
             'all_emotions': severity_data.get('all_emotions'),
             'severity': severity_data.get('severity'),
             'suggestion': severity_data.get('suggestion'),
+            'recommendation': severity_data.get('recommendation'),
+            'recommendation_source': severity_data.get('recommendation_source'),
             'source_results': severity_data.get('source_results'),
             'timestamp': datetime.datetime.now(),
             'date': datetime.date.today().isoformat()
@@ -231,27 +407,32 @@ def detect_voice_emotion_upload():
             return jsonify({"error": "No file selected"}), 400
         
         if not allowed_file(file.filename, ALLOWED_AUDIO_EXTENSIONS):
-            return jsonify({"error": "Invalid audio format. Allowed: wav, mp3, ogg, flac, m4a"}), 400
+            return jsonify({"error": "Invalid audio format. Allowed: wav, mp3, ogg, flac, m4a, webm"}), 400
         
         if voice_detector is None:
             return jsonify({"error": "Voice emotion model not loaded"}), 500
         
-        # Save temp file
-        filename = secure_filename(file.filename)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
+        tmp_path = None
+        try:
+            # Save temp file
+            filename = secure_filename(file.filename)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+                file.save(tmp.name)
+                tmp_path = tmp.name
+
+            # Detect emotion; voice response should not wait for external recommendation APIs.
+            result = enrich_emotion_result(
+                voice_detector.detect_emotion_from_file(tmp_path),
+                'voice',
+                include_ai_recommendation=False
+            )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
         
-        # Detect emotion
-        result = enrich_emotion_result(voice_detector.detect_emotion_from_file(tmp_path), 'voice')
-        
-        # Save to Firebase
-        user_id = get_user_from_token(request)
-        if user_id and 'emotion' in result:
-            save_emotion_to_firebase(user_id, 'voice', result)
-        
-        # Clean up
-        os.remove(tmp_path)
+        # Save to Firebase without delaying the result shown to the user.
+        if 'emotion' in result:
+            save_emotion_to_firebase_async(request.headers, 'voice', result)
         
         return jsonify(result), 200 if 'emotion' in result else 400
     
@@ -277,12 +458,15 @@ def detect_voice_emotion_base64():
         if voice_detector is None:
             return jsonify({"error": "Voice emotion model not loaded"}), 500
         
-        result = enrich_emotion_result(voice_detector.detect_emotion_from_base64(data['audio'], audio_format), 'voice')
+        result = enrich_emotion_result(
+            voice_detector.detect_emotion_from_base64(data['audio'], audio_format),
+            'voice',
+            include_ai_recommendation=False
+        )
         
-        # Save to Firebase
-        user_id = get_user_from_token(request)
-        if user_id and 'emotion' in result:
-            save_emotion_to_firebase(user_id, 'voice', result)
+        # Save to Firebase without delaying the result shown to the user.
+        if 'emotion' in result:
+            save_emotion_to_firebase_async(request.headers, 'voice', result)
         
         return jsonify(result), 200 if 'emotion' in result else 400
     
@@ -447,9 +631,24 @@ def detect_multimodal_severity():
             'voice': results.get('voice'),
             'text': results.get('text')
         }
-        severity_result['suggestion'] = get_multimodal_suggestion(
-            severity_result['severity']['level']
+        recommendation, recommendation_source = generate_ai_recommendation(
+            severity_result.get('emotion'),
+            severity_result.get('severity'),
+            'multimodal',
+            severity_result.get('confidence'),
+            severity_result.get('all_emotions'),
+            severity_result.get('source_results')
         )
+        if not recommendation:
+            recommendation = fallback_recommendation(
+                severity_result.get('emotion'),
+                severity_result.get('severity'),
+                'multimodal'
+            )
+            recommendation_source = 'local'
+        severity_result['suggestion'] = recommendation
+        severity_result['recommendation'] = recommendation
+        severity_result['recommendation_source'] = recommendation_source
         severity_result['timestamp'] = datetime.datetime.now().isoformat()
         severity_result['date'] = datetime.date.today().isoformat()
 
@@ -507,5 +706,6 @@ def emotion_health():
             "face": face_detector is not None,
             "voice": voice_detector is not None,
             "text": text_detector is not None
-        }
+        },
+        "voice_engine": VOICE_ENGINE
     }), 200

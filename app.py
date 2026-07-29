@@ -1,3 +1,11 @@
+import os
+import logging
+
+# Some local shells/IDEs inject stale proxy settings such as 127.0.0.1:9.
+# Firebase auth calls should go directly unless a working proxy is explicitly configured.
+for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    os.environ.pop(proxy_var, None)
+
 from flask import Flask, request, make_response, jsonify
 from flask_cors import CORS
 from routes.userroutes import user_bp
@@ -6,8 +14,6 @@ from routes.adminroutes import admin_bp
 from routes.emotionroutes import emotion_bp
 from routes.forgetreset import auth_bp
 from routes.chatbotroutes import chatbot_bp
-import os
-import logging
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(

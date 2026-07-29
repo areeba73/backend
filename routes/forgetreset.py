@@ -5,6 +5,7 @@ import os
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
+from firebase_rest import firebase_post
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ def forgot_password():
             "canHandleCodeInApp": True
         }
 
-        response = requests.post(url, json=payload, timeout=10)
+        response = firebase_post(url, json=payload, timeout=10)
         res_data = response.json()
 
         if response.status_code == 200:
@@ -126,7 +127,7 @@ def complete_reset():
             "newPassword": new_password
         }
 
-        response = requests.post(url, json=payload, timeout=10)
+        response = firebase_post(url, json=payload, timeout=10)
         res_data = response.json()
 
         if response.status_code == 200:

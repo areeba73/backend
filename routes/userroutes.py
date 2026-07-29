@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from firebase_admin import auth, firestore
 import requests
 from config import db, Config
+from firebase_rest import firebase_post
 from datetime import datetime, timedelta
 import threading
 import time
@@ -129,7 +130,7 @@ def user_signup():
         if not is_admin:
             logger.info(f" Generating ID token for: {email}")
             custom_token = auth.create_custom_token(user.uid).decode('utf-8')
-            id_token_res = requests.post(
+            id_token_res = firebase_post(
                 f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={Config.FIREBASE_WEB_API_KEY}",
                 json={"token": custom_token, "returnSecureToken": True},
                 timeout=10
@@ -149,7 +150,7 @@ def user_signup():
             }
             
             logger.info(f" Sending verification email to: {email}")
-            verify_response = requests.post(
+            verify_response = firebase_post(
                 f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={Config.FIREBASE_WEB_API_KEY}",
                 json=verify_payload,
                 timeout=10
@@ -208,7 +209,7 @@ def user_login():
         
         # Firebase Sign In
         sign_in_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={Config.FIREBASE_WEB_API_KEY}"
-        sign_in_response = requests.post(sign_in_url, json={
+        sign_in_response = firebase_post(sign_in_url, json={
             "email": email,
             "password": password,
             "returnSecureToken": True

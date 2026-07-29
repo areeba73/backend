@@ -11,11 +11,17 @@ chatbot_bp = Blueprint('chatbot', __name__)
 
 # Configure Gemini API using REST only (no SDK)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+_gemini_session = requests.Session()
+_gemini_session.trust_env = False
+_gemini_session.proxies = {}
 
 model_loaded = False
 available_model = "gemini-2.5-flash"  # Use the available model from API
 QUOTA_LIMIT_MESSAGE = "Daily AI limit reached. Please try again tomorrow."
 MODEL_BUSY_MESSAGE = "EmoBot is busy right now. Please try again in a moment."
+MIN_HELPFUL_REPLY_WORDS = 35
+MAX_HELPFUL_REPLY_WORDS = 120
+MAX_OUTPUT_TOKENS = 500
 
 SYSTEM_PROMPT = """
 You are EmoBot, a real conversational emotional-support chatbot inside a mood tracking app.
@@ -24,9 +30,11 @@ Talk to the user naturally and help them calm down according to their latest det
 Use the mood context quietly. Do not give one fixed template for a mood. Do not repeat the same response.
 If severity is high, first help the user settle their body with a gentle grounding or breathing suggestion, then continue the conversation.
 Validate feelings and speak warmly. Give a complete reply before asking any follow-up question.
-Do not shorten, summarize, or cut off your answer. Avoid tiny one-line replies unless the user clearly asks for a very short answer.
-Give enough detail that the user feels fully answered. When the user needs support, usually use 3 to 6 natural paragraphs with practical, calming guidance.
-Do not end early after only one suggestion. Complete the thought, then ask a follow-up question if it helps.
+Give a complete but compact reply: usually 4 to 6 short sentences, or 2 to 3 short bullet points when giving tips.
+Aim for 60 to 110 words. Do not exceed 120 words unless the user clearly asks for detail.
+Do not give one-line answers, but also do not write long essay-style replies.
+Explain suggestions briefly enough that the meaning is clear and the user can follow them.
+Give one or two practical calming suggestions, then ask one gentle follow-up question if useful.
 Do not diagnose, do not make medical claims, and do not sound robotic.
 If the user may be unsafe or overwhelmed, gently suggest contacting a trusted person, doctor, or emergency support.
 Reply in the same style as the user: Roman Urdu for Roman Urdu, English for English.
@@ -167,7 +175,7 @@ def build_chat_prompt(message, emotion_context=None, chat_history=None, retry_no
         + ("\n\nRecent conversation:\n" + "\n".join(history_lines) if history_lines else "")
         + "\n\nCurrent user message:\n"
         + message
-        + "\n\nReply as EmoBot now with a complete, uncut response."
+        + "\n\nReply as EmoBot now with a complete but compact response. Keep the meaning clear without making it long."
         + "\n".join(retry_lines)
     )
 
@@ -181,7 +189,41 @@ def is_too_short_ai_response(text, user_message):
     cleaned = re.sub(r'\s+', ' ', str(text or '')).strip()
     user_words = len(str(user_message or '').split())
     reply_words = len(cleaned.split())
-    return user_words >= 3 and reply_words < 35
+    return user_words >= 3 and reply_words < MIN_HELPFUL_REPLY_WORDS
+
+def is_too_long_ai_response(text):
+    """Detect replies that are more detailed than the chat UI needs."""
+    cleaned = re.sub(r'\s+', ' ', str(text or '')).strip()
+    reply_words = len(cleaned.split())
+    return reply_words > MAX_HELPFUL_REPLY_WORDS
+
+def is_roman_urdu_message(text):
+    """Best-effort check for Roman Urdu so fallback matches the user's style."""
+    markers = [
+        'mujhe', 'apko', 'aap', 'bohat', 'bhot', 'hai', 'ho', 'karun',
+        'kya', 'nahi', 'nahin', 'udaas', 'pareshan', 'stress'
+    ]
+    lowered = str(text or '').lower()
+    return any(marker in lowered.split() for marker in markers)
+
+def fallback_support_response(message):
+    """Balanced fallback when Gemini returns an unusable tiny or oversized reply."""
+    if is_roman_urdu_message(message):
+        return (
+            "Mujhe samajh aa raha hai ke abhi stress bohat heavy lag raha hoga. "
+            "Pehle bas 30 seconds ke liye saans ahista karo: 4 count mein andar, 4 count hold, phir 6 count mein bahar. "
+            "Phir apne aas paas 3 cheezen dekho aur unka naam dil mein bolo, taake mind thora present moment mein aaye. "
+            "Agar possible ho to ek glass pani pi lo ya kisi trusted insan ko short message bhej do. "
+            "Abhi sab se zyada kis cheez ka pressure feel ho raha hai?"
+        )
+
+    return (
+        "I hear you, and that kind of stress can feel really heavy. "
+        "Try one small reset first: breathe in for 4 counts, hold for 4, then breathe out slowly for 6. "
+        "After that, name 3 things you can see around you so your mind has something steady to focus on. "
+        "If you can, drink some water or send a short message to someone you trust. "
+        "What feels like the biggest pressure right now?"
+    )
 
 def clean_bot_response(text, emotion_context=None):
     """Return Gemini's response without shortening or compacting it."""
@@ -197,7 +239,7 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
         }
 
         retry_note = None
-        for attempt in range(2):
+        for attempt in range(3):
             payload = {
                 "contents": [
                     {
@@ -209,14 +251,20 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
                     }
                 ],
                 "generationConfig": {
-                    "maxOutputTokens": 4096,
-                    "temperature": 0.85,
+                    "maxOutputTokens": MAX_OUTPUT_TOKENS,
+                    "temperature": 0.8,
                     "topP": 0.95
                 }
             }
             
             print(f"Calling Gemini API with model: {available_model}, attempt {attempt + 1}...")
-            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            response = _gemini_session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=30,
+                proxies={"http": None, "https": None}
+            )
             
             print(f"Response Status: {response.status_code}")
             
@@ -232,15 +280,16 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
                     print(f"Gemini finishReason={finish_reason} response_chars={len(text)} response_words={len(text.split()) if text else 0}")
 
                     too_short = is_too_short_ai_response(text, message)
-                    if text and not is_broken_ai_response(text) and (not too_short or attempt == 1):
+                    too_long = is_too_long_ai_response(text)
+                    if text and not is_broken_ai_response(text) and not too_short and not too_long:
                         print(f"Text: {text}")
                         return clean_bot_response(text, emotion_context)
 
-                    print(f"Gemini returned broken/too-short text. finishReason={finish_reason} text={text if text else ''}")
-                    retry_note = "Your previous response was empty or too short. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer. Use several helpful sentences and do not summarize."
+                    print(f"Gemini returned broken/too-short/too-long text. finishReason={finish_reason} text={text if text else ''}")
+                    retry_note = "Your previous response was not the right length. Reply again in 60 to 110 words: complete, clear, but not long."
                     continue
 
-                retry_note = "No valid response was produced. Give a complete, natural, calming reply now. Do not make it a tiny one-line answer. Use several helpful sentences and do not summarize."
+                retry_note = "No valid response was produced. Reply in 60 to 110 words: complete, clear, but not long."
                 continue
 
             break
@@ -266,7 +315,7 @@ def call_gemini_rest_api(message, emotion_context=None, chat_history=None):
                 return MODEL_BUSY_MESSAGE
             return MODEL_BUSY_MESSAGE
 
-        return MODEL_BUSY_MESSAGE
+        return fallback_support_response(message)
     
     except requests.exceptions.Timeout:
         print(" Request timed out")

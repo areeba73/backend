@@ -1,0 +1,12 @@
+Loading FER2013 from folder: models/pretrained_models/fer2013
+Files in folder: ['Angry.png', 'Detector_In_Action.py', 'emotion_detection_model.h5', 'Emotion_Recognition_Train.ipynb', 'haarcascade_frontalface_default.xml', 'Happy.png', 'LICENSE', 'README.md']
+Loading Keras model from: models\pretrained_models\fer2013\emotion_detection_model.h5
+FER2013 Face Emotion Detector loaded successfully!
+Using fast voice feature detector (soundfile_numpy_v2).
+Loading text emotion model from HuggingFace...
+   (First download: ~2-3 min, ~250MB - future use cache)
+Text emotion model loaded successfully!
+GEMINI_API_KEY found: AQ.Ab8RN6K...
+Using model: gemini-2.5-flash
+ * Serving Flask app 'app'
+ * Debug mode: off
